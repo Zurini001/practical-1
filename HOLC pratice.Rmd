@@ -1,0 +1,356 @@
+---
+title: "HOLC"
+author: "Ruimin"
+date: "12/14/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(sf)
+library(here)
+library(fs)
+library(stringr)
+library(utils)
+library(sp)
+library(raster)
+```
+
+
+Could work out the % of each HOLC level in current census tracts and then relate that to temperature ...e.g. % of HOLC grade A vs temp, % of HOLC grade B vs temp. 
+
+Basic - just show the temp differences in HOLC neighbourhoods, but then discuss how does this relate to current census tracts
+
+```{r}
+
+census_shape <- st_read(here::here(#"Data", "practice_Q", 
+                                  "Census Tracts 2010",
+                                  "geo_export_4f0edcf3-ca13-43a5-a50b-879cda3be158.shp"))%>%
+  st_transform(., crs=32611) # 
+
+HOLC <- st_read(here::here("CALosAngeles1939", "cartodb-query.shp"))%>%
+    st_transform(., crs=32611)
+```
+Landsat data
+
+```{r eval=F}
+
+listfiles<-dir_info(here::here("Landsat")) %>%
+  dplyr::filter(str_detect(path, ".tar")) %>%
+  dplyr::select(path)%>%
+  dplyr::pull()%>%
+  #print out the .gz file
+  print()%>%
+  as.character()%>%
+  utils::untar(exdir=here::here("Landsat"))
+```
+```{r}
+# List your raster files excluding band 8 using the patter argument
+Bands_need<-dir_info(here::here("Landsat"))%>%
+  dplyr::filter(str_detect(path, "[B456].TIF")) %>%
+  #dplyr::filter(str_detect(path, "B10.TIF"))%>%
+  #dplyr::filter(str_detect(path, "B11", negate=TRUE))%>%
+  dplyr::select(path)%>%
+  arrange()%>%
+  pull()%>%
+  as.character()%>%
+  # Load our raster layers into a stack
+  raster::stack()
+
+names(Bands_need) <- c('red', 'NIR', 'SWIR1') 
+
+Thermal<-dir_info(here::here("Landsat"))%>%
+  dplyr::filter(str_detect(path, "B10.TIF")) %>%
+  dplyr::select(path)%>%
+  arrange()%>%
+  pull()%>%
+  as.character()%>%
+  # Load our raster layers into a stack
+  raster::stack()
+
+
+thermal_mask <- Thermal %>%
+    raster::crop(.,HOLC)
+
+thermal_crop <- thermal_mask %>%
+    raster::mask(.,HOLC)
+
+
+lsatmask1 <- Bands_need %>%
+  # now crop our temp data to the extent
+  raster::crop(.,HOLC)
+
+# Error in x$.self$finalize() : attempt to apply non-function
+# this error is fine to ignore it's from the garbage collector.
+
+raster::plot(thermal_mask)
+
+#takes some time
+lsat2 <- lsatmask1%>%
+    terra::mask(.,  HOLC)
+
+
+
+```
+subset the census tracts within HOLC
+```{r}
+census_sub <- census_shape[HOLC,, op=st_intersects]
+
+library(tmap)
+
+
+tm_shape(HOLC) +
+  tm_polygons(col = "blue")+
+  tm_shape(census_sub) +
+  tm_polygons(col = "red", alpha = 0.5) 
+
+```
+
+
+
+NDVI
+```{r}
+
+NDVI <- (lsatmask1$NIR - lsatmask1$red)/ (lsatmask1$NIR + lsatmask1$red)
+
+# you need the sp package loaded for this...
+
+NDVI %>%
+  plot(.,col = rev(terrain.colors(10)), main = "Landsat-NDVI")
+  
+
+```
+
+MTL - readMTL didn't work due to new projection parameter
+
+```{r}
+#library(RStoolbox)
+
+TOA <- (0.0003342 *
+  thermal_crop) + 0.1
+
+K1 <- as.numeric(774.8853)
+
+K2 <- as.numeric(1321.0789)
+  
+Brighttemp <- (K2 / log((K1 / TOA) + 1))
+
+```
+
+
+```{r}
+facveg <- (NDVI-0.2/0.5-0.2)^2
+
+emiss <- (0.004*facveg)+0.986
+```
+
+```{r}
+Boltzmann <- 1.38*10e-23
+Plank <- 6.626*10e-34
+c <- 2.998*10e8
+
+p <- Plank*(c/Boltzmann)
+
+lambda <- 1.09e-5
+
+LST <- Brighttemp/(1 +(lambda*Brighttemp/p)*log(emiss))
+
+
+LST <- LST-273.15
+
+
+```
+
+NDBI
+
+```{r}
+
+NDBI=((lsatmask1$SWIR1-
+         lsatmask1$NIR)/
+        (lsatmask1$SWIR1+
+        lsatmask1$NIR))
+
+# NDBI %>%
+#   raster::writeRaster(., "NDBI", 
+#               bylayer=TRUE, 
+#               format='GTiff', 
+#               overwrite=TRUE)
+```
+
+At the miment we have 
+
+* Temp for the extent of HOLC
+* Census tracts within the HOLC (intersecting them)
+
+WHat do i want
+* Temp within each HOLC
+* RElationship between area of HOLC within census tract and temperature so that would mean % of census tract graded A (or B/C/D) and temp
+
+Simple, mean temp per HOLC
+
+```{r}
+#LST_per_HOLC <- raster::extract(LST, HOLC, fun=mean, na.rm=TRUE, df=TRUE)
+
+LST_per_census_within_HOLC <- raster::extract(LST, census_sub, fun=mean, na.rm=TRUE, df=TRUE)
+
+
+LST_per_census_within_HOLC<-LST_per_census_within_HOLC %>%
+  mutate(ID=census_sub$ct10)%>%
+  rename(temp=layer)
+
+
+census_sub <- census_sub %>%
+  dplyr::mutate(census_area=(st_area(.)))
+
+intersect <- st_intersection(HOLC, census_sub)%>%
+    dplyr::mutate(intersect_area=(st_area(.)))
+
+tm_shape(intersect) +
+  tm_polygons(col = "blue")+
+  tm_shape(HOLC) +
+  tm_borders(col="black")
+
+```
+
+
+
+```{r}
+
+example_overlap <- intersect %>%
+  filter(ct10==125200)
+
+AreaA <- intersect %>%
+  group_by(ct10)%>%
+  filter(holc_grade=="A")%>%
+  summarise(A_area=sum(intersect_area))
+
+AreaB <- intersect %>%
+  group_by(ct10)%>%
+  filter(holc_grade=="B")%>%
+  summarise(B_area=sum(intersect_area))
+
+AreaC <- intersect %>%
+  group_by(ct10)%>%
+  filter(holc_grade=="C")%>%
+  summarise(C_area=sum(intersect_area))
+
+AreaD <- intersect %>%
+  group_by(ct10)%>%
+  filter(holc_grade=="D")%>%
+  summarise(D_area=sum(intersect_area))
+
+```
+
+```{r}
+
+# join_back
+
+census_shapeA <- census_shape %>%
+  st_drop_geometry()%>%
+  left_join(., 
+            AreaA,
+            by = c("ct10" = "ct10"))
+
+census_shapeAB <- census_shapeA %>%
+  left_join(., 
+            AreaB,
+            by = c("ct10" = "ct10"))
+
+census_shapeABC <- census_shapeAB %>%
+  left_join(., 
+            AreaC,
+            by = c("ct10" = "ct10"))
+
+census_shapeABCD <- census_shapeABC %>%
+  left_join(., 
+            AreaD,
+            by = c("ct10" = "ct10"))%>%
+  as_tibble()
+
+
+pick<-census_shapeABCD %>%
+  dplyr::select(ct10, A_area, B_area, C_area, D_area)
+
+census_shape_joined <- census_shape %>%
+  left_join(., 
+            pick,
+            by = c("ct10" = "ct10"))%>%
+  dplyr::mutate(tract_area=st_area(.))
+
+
+```
+
+% HOLC in tract
+
+```{r}
+
+census_shape_joined_percent <- census_shape_joined %>%
+  mutate(percent_area_A=(A_area/tract_area)*100)%>%
+  mutate(percent_area_B=(B_area/tract_area)*100)%>%
+  mutate(percent_area_C=(C_area/tract_area)*100)%>%
+  mutate(percent_area_D=(D_area/tract_area)*100)
+
+```
+
+add in temperature
+
+```{r}
+census_shape_joined_percent_temp <- census_shape_joined_percent %>%
+  left_join(., 
+            LST_per_census_within_HOLC,
+            by = c("ct10" = "ID"))
+
+```
+
+```{r}
+
+library(ggplot2)
+
+A <- census_shape_joined_percent_temp %>%
+  st_drop_geometry(.)%>%
+  #drop_na(.)%>%
+  as_tibble(.)%>%
+  ggplot(aes(x = as.numeric(percent_area_A) , 
+           y = as.numeric(temp)), 
+           data=.)+
+  geom_point()+
+  stat_smooth(method="lm", se=FALSE, size=1)
+
+B <- census_shape_joined_percent_temp %>%
+  st_drop_geometry(.)%>%
+  #drop_na(.)%>%
+  as_tibble(.)%>%
+  ggplot(aes(x = as.numeric(percent_area_B) , 
+           y = as.numeric(temp)), 
+           data=.)+
+  geom_point()
+
+C <- census_shape_joined_percent_temp %>%
+  st_drop_geometry(.)%>%
+  #drop_na(.)%>%
+  as_tibble(.)%>%
+  ggplot(aes(x = as.numeric(percent_area_C) , 
+           y = as.numeric(temp)), 
+           data=.)+
+  geom_point()
+
+
+D <- census_shape_joined_percent_temp %>%
+  st_drop_geometry(.)%>%
+  #drop_na(.)%>%
+  as_tibble(.)%>%
+  ggplot(aes(x = as.numeric(percent_area_D) , 
+           y = as.numeric(temp)), 
+           data=.)+
+  geom_point()
+
+library(cowplot)
+
+all <- plot_grid(
+  A, B, C, D,
+  labels = "AUTO", ncol = 2
+)
+
+all
+```
+
